@@ -1,0 +1,3 @@
+[submodule "ac/ac-common"]
+	path = ac/ac-common
+	url = https://github.com/autumncoffee/cxx-common.git
