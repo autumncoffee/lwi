@@ -31,6 +31,7 @@ add_executable(lwi ${AC_LWI_SOURCES})
 target_link_libraries(
     lwi
     ac_common
+    ac_common_utils
     "-lstdc++fs"
 )
 

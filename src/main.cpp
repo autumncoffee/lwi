@@ -15,6 +15,9 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <ac-common/utils/string.hpp>
+#include <sys/syscall.h>
+#include <unordered_set>
+#include <fstream>
 
 #ifdef RELEASE_FILESYSTEM
 #include <filesystem>
@@ -38,12 +41,32 @@ static inline dev_t GetDeviceID(const std::string& path) {
     return out.st_dev;
 }
 
-static inline bool IsMountPoint(const std::filesystem::path& path) {
+static inline std::unordered_set<std::string> GetMounts() {
+    std::unordered_set<std::string> out;
+    std::ifstream file("/proc/self/mounts");
+    std::string line;
+
+    while (std::getline(file, line)) {
+        auto&& parts = NAC::NStringUtils::Split(line, ' ');
+
+        if (parts.size() > 1) {
+            out.insert((std::string)parts.at(1));
+        }
+    }
+
+    return out;
+}
+
+static inline bool IsMountPoint(const std::filesystem::path& path, const std::unordered_set<std::string>& mounts) {
     if (!std::filesystem::exists(path)) {
         return false;
     }
 
-    return (GetDeviceID(path.string()) != GetDeviceID(path.parent_path().string()));
+    if (GetDeviceID(path.string()) != GetDeviceID(path.parent_path().string())) {
+        return true;
+    }
+
+    return mounts.count(path.string()) > 0;
 }
 
 static inline void SeedFile(const std::filesystem::path& path, const std::string& data) {
@@ -57,6 +80,32 @@ static inline bool SetFileContent(const std::filesystem::path& path, const std::
     NAC::TFile file(path.string(), NAC::TFile::ACCESS_CREATE);
     file.Append(content);
     return (bool)file;
+}
+
+static inline bool MountSpecial() {
+    static const std::unordered_set<std::string> emptyMounts;
+    static const std::vector<std::tuple<std::string, std::string, std::string, int>> specialFses {
+        {"sysfs", "sys", "/sys", 0},
+        {"proc", "proc", "/proc", MS_REC},
+        {"devtmpfs", "udev", "/dev", 0}
+    };
+
+    for (const auto& [fstype, source, dest, flags] : specialFses) {
+        std::filesystem::create_directory(dest);
+
+        if (IsMountPoint(dest, emptyMounts)) {
+            continue;
+        }
+
+        int rv = mount(source.c_str(), dest.c_str(), fstype.c_str(), flags, nullptr);
+
+        if (rv == -1) {
+            perror(("mount(" + dest + ")").c_str());
+            return false;
+        }
+    }
+
+    return true;
 }
 
 int main(int argc, char** argv) {
@@ -73,6 +122,8 @@ int main(int argc, char** argv) {
     bool haveCPUMaxPeriod(false);
     bool haveMemoryLimit(false);
     bool tryCGroup2(true);
+
+    auto mounts = GetMounts();
 
     {
         size_t posNum(0);
@@ -194,7 +245,7 @@ int main(int argc, char** argv) {
         static const std::string cgroupVersionFileName(".cgver");
         static const std::filesystem::path defaultCGroupV1Path("/sys/fs/cgroup");
 
-        if (!IsMountPoint(cgroupDir)) {
+        if (!IsMountPoint(cgroupDir, mounts)) {
             int rv = -1;
 
             if (tryCGroup2) {
@@ -208,7 +259,7 @@ int main(int argc, char** argv) {
                 SetFileContent(cgroupVersionFileName, "2");
 
             } else if (errno == ENODEV) {
-                if (!IsMountPoint(defaultCGroupV1Path)) {
+                if (!IsMountPoint(defaultCGroupV1Path, mounts)) {
                     std::filesystem::create_directories(defaultCGroupV1Path);
                     rv = mount("cgroup_root", defaultCGroupV1Path.c_str(), "tmpfs", 0, nullptr);
 
@@ -251,7 +302,7 @@ int main(int argc, char** argv) {
             }) {
                 std::filesystem::path path(defaultCGroupV1Path / controller);
 
-                if (!IsMountPoint(path)) {
+                if (!IsMountPoint(path, mounts)) {
                     std::filesystem::create_directory(path);
 
                     int rv = mount("cgroup", path.c_str(), "cgroup", 0, controller.c_str());
@@ -378,7 +429,7 @@ int main(int argc, char** argv) {
 
             auto path = nsDir / it.second;
 
-            if (!IsMountPoint(path)) {
+            if (!IsMountPoint(path, mounts)) {
                 flags |= it.first;
                 NAC::TFile file(path.string(), NAC::TFile::ACCESS_CREATE);
             }
@@ -491,8 +542,23 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!MountSpecial()) {
+        return 1;
+    }
+
+    mounts.merge(GetMounts());
+
     std::filesystem::path rootDir(workdir / "root");
     std::filesystem::create_directories(rootDir);
+
+    if (!IsMountPoint(rootDir, mounts)) {
+        int rv = mount(rootDir.c_str(), rootDir.c_str(), "none", MS_BIND|MS_REC, nullptr);
+
+        if (rv == -1) {
+            perror("mount(bind root)");
+            return 1;
+        }
+    }
 
     if (defaultMounts) {
         {
@@ -520,7 +586,7 @@ int main(int argc, char** argv) {
             auto dest = rootDir / dir;
             std::filesystem::create_directory(dest);
 
-            if (!std::filesystem::is_empty(dest)) {
+            if (IsMountPoint(dest, mounts)) {
                 continue;
             }
 
@@ -541,19 +607,10 @@ int main(int argc, char** argv) {
     }
 
     {
-        int rv = chroot(rootDir.c_str());
+        int rv = chdir(rootDir.c_str());
 
         if (rv == -1) {
-            perror(("chroot(" + rootDir.string() + ")").c_str());
-            return 1;
-        }
-    }
-
-    {
-        int rv = chdir("/");
-
-        if (rv == -1) {
-            perror("chdir(/)");
+            perror(("chdir(" + rootDir.string() + ")").c_str());
             return 1;
         }
     }
@@ -575,26 +632,34 @@ int main(int argc, char** argv) {
         }
 
         {
-            static const std::vector<std::tuple<std::string, std::string, std::string, int>> specialFses {
-                {"sysfs", "sys", "/sys", 0},
-                {"proc", "proc", "/proc", MS_REC},
-                {"devtmpfs", "udev", "/dev", 0}
-            };
+            long rv = syscall(SYS_pivot_root, ".", ".");
 
-            for (const auto& [fstype, source, dest, flags] : specialFses) {
-                std::filesystem::create_directory(dest);
-
-                if (IsMountPoint(dest)) {
-                    continue;
-                }
-
-                int rv = mount(source.c_str(), dest.c_str(), fstype.c_str(), flags, nullptr);
-
-                if (rv == -1) {
-                    perror(("mount(" + dest + ")").c_str());
-                    return 1;
-                }
+            if (rv == -1) {
+                perror("pivot_root");
+                return 1;
             }
+        }
+
+        {
+            int rv = umount2(".", MNT_DETACH);
+
+            if (rv == -1) {
+                perror("umount2");
+                return 1;
+            }
+        }
+
+        {
+            int rv = chroot(".");
+
+            if (rv == -1) {
+                perror("chroot");
+                return 1;
+            }
+        }
+
+        if (!MountSpecial()) {
+            return 1;
         }
 
         {
