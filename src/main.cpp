@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <ac-common/utils/string.hpp>
 
 #ifdef RELEASE_FILESYSTEM
 #include <filesystem>
@@ -25,7 +26,7 @@ namespace std {
 }
 #endif
 
-dev_t GetDeviceID(const std::string& path) {
+static inline dev_t GetDeviceID(const std::string& path) {
     struct stat out;
     int rv = stat(path.c_str(), &out);
 
@@ -37,7 +38,7 @@ dev_t GetDeviceID(const std::string& path) {
     return out.st_dev;
 }
 
-bool IsMountPoint(const std::filesystem::path& path) {
+static inline bool IsMountPoint(const std::filesystem::path& path) {
     if (!std::filesystem::exists(path)) {
         return false;
     }
@@ -45,27 +46,143 @@ bool IsMountPoint(const std::filesystem::path& path) {
     return (GetDeviceID(path.string()) != GetDeviceID(path.parent_path().string()));
 }
 
-void SeedFile(const std::filesystem::path& path, const std::string& data) {
+static inline void SeedFile(const std::filesystem::path& path, const std::string& data) {
     if (!std::filesystem::exists(path)) {
         NAC::TFile file(path.string(), NAC::TFile::ACCESS_CREATEX);
         file.Append(data);
     }
 }
 
+static inline bool SetFileContent(const std::filesystem::path& path, const std::string& content) {
+    NAC::TFile file(path.string(), NAC::TFile::ACCESS_CREATE);
+    file.Append(content);
+    return (bool)file;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        std::cerr << "Usage: " << argv[0] << " id /path/to/workdir /path/to/binary [binary args]" << std::endl;
+    const char* runId("\0");
+    const char* pathToWorkdir("\0");
+    std::vector<char*> binaryAndArgs;
+    size_t memoryLimit(0);
+    size_t cpuMax(0);
+    size_t cpuMaxPeriod(0);
+    uid_t newUid(65534);
+    gid_t newGid(65534);
+    bool defaultMounts(true);
+    bool haveCPUMax(false);
+    bool haveCPUMaxPeriod(false);
+    bool haveMemoryLimit(false);
+    bool tryCGroup2(true);
+
+    {
+        size_t posNum(0);
+
+        for (int i = 1; i < argc; ++i) {
+            if (posNum > 1) {
+                binaryAndArgs.push_back(argv[i]);
+                continue;
+            }
+
+            if (strcmp("--mem-max", argv[i]) == 0) {
+                ++i;
+                NAC::NStringUtils::FromString(strlen(argv[i]), argv[i], memoryLimit);
+                haveMemoryLimit = true;
+
+            } else if (strcmp("--cpu-max", argv[i]) == 0) {
+                ++i;
+                NAC::NStringUtils::FromString(strlen(argv[i]), argv[i], cpuMax);
+                haveCPUMax = true;
+
+            } else if (strcmp("--cpu-max-period", argv[i]) == 0) {
+                ++i;
+                NAC::NStringUtils::FromString(strlen(argv[i]), argv[i], cpuMaxPeriod);
+                haveCPUMaxPeriod = true;
+
+            } else if (strcmp("--root", argv[i]) == 0) {
+                newUid = 0;
+                newGid = 0;
+
+            } else if (strcmp("--uid", argv[i]) == 0) {
+                ++i;
+                NAC::NStringUtils::FromString(strlen(argv[i]), argv[i], newUid);
+
+            } else if (strcmp("--gid", argv[i]) == 0) {
+                ++i;
+                NAC::NStringUtils::FromString(strlen(argv[i]), argv[i], newGid);
+
+            } else if (strcmp("--no-default-mounts", argv[i]) == 0) {
+                defaultMounts = false;
+
+            } else if (strcmp("--no-cgroup2", argv[i]) == 0) {
+                tryCGroup2 = false;
+
+            } else {
+                switch (posNum) {
+                    case 0: {
+                        runId = argv[i];
+                        ++posNum;
+                        break;
+                    }
+                    case 1: {
+                        pathToWorkdir = argv[i];
+                        ++posNum;
+                        break;
+                    }
+                    default:
+                        return 1;
+                }
+            }
+        }
+    }
+
+    if (haveCPUMaxPeriod && !haveCPUMax) {
+        std::cerr << "--cpu-max-period should not be used without --cpu-max" << std::endl;
         return 1;
     }
 
-    std::filesystem::path workdir(std::filesystem::absolute(argv[2]));
+    if (haveCPUMaxPeriod && (cpuMaxPeriod == 0)) {
+        std::cerr << "--cpu-max-period should be greater than 0" << std::endl;
+        return 1;
+    }
+
+    if (
+        (strlen(runId) == 0)
+        || (strlen(pathToWorkdir) == 0)
+        || binaryAndArgs.empty()
+    ) {
+        std::cerr
+            << "USAGE:\n\t" << argv[0] << " [--mem-max 1073741824] [--cpu-max 10000] [--cpu-max-period 100000] [--root] [--uid 0] [--gid 0] [--no-default-mounts] id /path/to/workdir /path/to/binary [binary args]\n"
+            << "\n"
+            << "REQUIRED PARAMETERS:\n"
+            << "\tid - Unique id for running command; will be used as cgroup name\n"
+            << "\t/path/to/workdir - Path to container directory\n"
+            << "\t/path/to/binary - Path to binary that should be run within container\n"
+            << "\n"
+            << "OPTIONAL PARAMETERS:\n"
+            << "\t--mem-max - Hard limit for memory, in bytes; \"0\" means \"unlimited\"\n"
+            << "\t--cpu-max - How much CPU time could be consumed in each period; \"0\" means \"unlimited\"\n"
+            << "\t--cpu-max-period - Duration of CPU usage period\n"
+            << "\t--root - Keep running as root\n"
+            << "\t--uid - Run as user with that id (setuid)\n"
+            << "\t--gid - Run with a group of that id (setgid)\n"
+            << "\t--no-default-mounts - Do not attempt to mount default host directories such as /bin and /lib into chroot\n"
+            << "\t--no-cgroup2 - Do not try to use cgroup2\n"
+            << std::endl
+        ;
+
+        return 1;
+    }
+
+    binaryAndArgs.push_back(nullptr);
+
+    std::filesystem::path workdir(std::filesystem::absolute(pathToWorkdir));
     std::filesystem::create_directories(workdir);
 
     {
-        int rv = chdir(argv[2]);
+        int rv = chdir(pathToWorkdir);
 
         if (rv == -1) {
-            perror((std::string("chdir(") + argv[2] + ")").c_str());
+            perror((std::string("chdir(") + pathToWorkdir + ")").c_str());
             return 1;
         }
     }
@@ -75,20 +192,25 @@ int main(int argc, char** argv) {
         std::filesystem::create_directory(cgroupDir);
 
         static const std::string cgroupVersionFileName(".cgver");
+        static const std::filesystem::path defaultCGroupV1Path("/sys/fs/cgroup");
 
         if (!IsMountPoint(cgroupDir)) {
-            int rv = mount("none", cgroupDir.c_str(), "cgroup2", 0, nullptr);
+            int rv = -1;
+
+            if (tryCGroup2) {
+                rv = mount("none", cgroupDir.c_str(), "cgroup2", 0, nullptr);
+
+            } else {
+                errno = ENODEV;
+            }
 
             if (rv == 0) {
-                NAC::TFile file(cgroupVersionFileName, NAC::TFile::ACCESS_CREATE);
-                file.Append("2");
+                SetFileContent(cgroupVersionFileName, "2");
 
             } else if (errno == ENODEV) {
-                static const std::string defaultCGroupPath("/sys/fs/cgroup");
-
-                if (!IsMountPoint(defaultCGroupPath)) {
-                    std::filesystem::create_directories(defaultCGroupPath);
-                    rv = mount("cgroup_root", defaultCGroupPath.c_str(), "tmpfs", 0, nullptr);
+                if (!IsMountPoint(defaultCGroupV1Path)) {
+                    std::filesystem::create_directories(defaultCGroupV1Path);
+                    rv = mount("cgroup_root", defaultCGroupV1Path.c_str(), "tmpfs", 0, nullptr);
 
                     if (rv == -1) {
                         perror("mount(cgroup)");
@@ -96,15 +218,14 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                rv = mount(defaultCGroupPath.c_str(), cgroupDir.c_str(), "none", MS_BIND, nullptr);
+                rv = mount(defaultCGroupV1Path.c_str(), cgroupDir.c_str(), "none", MS_BIND, nullptr);
 
                 if (rv == -1) {
                     perror("mount(bind cgroup)");
                     return 1;
                 }
 
-                NAC::TFile file(cgroupVersionFileName, NAC::TFile::ACCESS_CREATE);
-                file.Append("1");
+                SetFileContent(cgroupVersionFileName, "1");
 
             } else {
                 perror("mount(cgroup2)");
@@ -128,12 +249,12 @@ int main(int argc, char** argv) {
                 "blkio",
                 "pids"
             }) {
-                std::filesystem::path path(cgroupDir / controller);
+                std::filesystem::path path(defaultCGroupV1Path / controller);
 
                 if (!IsMountPoint(path)) {
                     std::filesystem::create_directory(path);
 
-                    int rv = mount(controller.c_str(), path.c_str(), "cgroup", 0, controller.c_str());
+                    int rv = mount("cgroup", path.c_str(), "cgroup", 0, controller.c_str());
 
                     if (rv == -1) {
                         perror(("mount(cgroup/" + controller + ")").c_str());
@@ -141,26 +262,85 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                path /= argv[1];
+                path /= runId;
                 std::filesystem::create_directory(path);
 
-                NAC::TFile file((path / "cgroup.procs").string(), NAC::TFile::ACCESS_CREATE);
-                file.Append(pidStr);
+                if ((controller == "memory") && haveMemoryLimit) {
+                    if (!SetFileContent(path / "memory.limit_in_bytes", (
+                            (memoryLimit == 0)
+                                ? std::string("-1")
+                                : std::to_string(memoryLimit)
+                    ))) {
+                        std::cerr << "Failed to set memory limit" << std::endl;
+                        return 1;
+                    }
+                }
 
-                if (!file) {
+                if ((controller == "cpu") && haveCPUMax) {
+                    if (!SetFileContent(path / "cpu.cfs_quota_us", (
+                            (cpuMax == 0)
+                                ? std::string("-1")
+                                : std::to_string(cpuMax)
+                    ))) {
+                        std::cerr << "Failed to set CPU limit" << std::endl;
+                        return 1;
+                    }
+
+                    if (haveCPUMaxPeriod) {
+                        if (!SetFileContent(path / "cpu.cfs_period_us", std::to_string(cpuMaxPeriod))) {
+                            std::cerr << "Failed to set CPU period duration" << std::endl;
+                            return 1;
+                        }
+                    }
+                }
+
+                if (!SetFileContent(path / "cgroup.procs", pidStr)) {
                     std::cerr << "Failed to add process to cgroup" << std::endl;
                     return 1;
                 }
             }
 
         } else if (cgroupVersionFile[0] == '2') {
-            auto path = cgroupDir / argv[1];
+            auto path = cgroupDir / runId;
             std::filesystem::create_directory(path);
 
-            NAC::TFile file((path / "cgroup.procs").string(), NAC::TFile::ACCESS_CREATE);
-            file.Append(pidStr);
+            if (!SetFileContent(path / "cgroup.subtree_control", "+cpu +memory +io +pids")) {
+                std::cerr << "Failed to setup cgroup2" << std::endl;
+                return 1;
+            }
 
-            if (!file) {
+            if (haveMemoryLimit) {
+                if (!SetFileContent(path / "memory.max", (
+                        (memoryLimit == 0)
+                            ? std::string("max")
+                            : std::to_string(memoryLimit)
+                ))) {
+                    std::cerr << "Failed to set memory limit" << std::endl;
+                    return 1;
+                }
+            }
+
+            if (haveCPUMax) {
+                std::string value;
+
+                if (cpuMax == 0) {
+                    value = "max";
+
+                } else {
+                    value = std::to_string(cpuMax);
+                }
+
+                if (haveCPUMaxPeriod) {
+                    value += " " + std::to_string(cpuMaxPeriod);
+                }
+
+                if (!SetFileContent(path / "cpu.max", value)) {
+                    std::cerr << "Failed to set CPU limit" << std::endl;
+                    return 1;
+                }
+            }
+
+            if (!SetFileContent(path / "cgroup.procs", pidStr)) {
                 std::cerr << "Failed to add process to cgroup2" << std::endl;
                 return 1;
             }
@@ -169,18 +349,6 @@ int main(int argc, char** argv) {
             std::cerr << "Invalid cgroup version" << std::endl;
             return 1;
         }
-    }
-
-    std::filesystem::path rootDir(workdir / "root");
-    std::filesystem::create_directory(rootDir);
-
-    {
-        auto etcDir = rootDir / "etc";
-        std::filesystem::create_directory(etcDir);
-
-        SeedFile(etcDir / "shadow", "root:*:16176:0:99999:7:::\n");
-        SeedFile(etcDir / "passwd", "root:x:0:0:root:/:/bin/sh\n");
-        SeedFile(etcDir / "group", "root:x:0:\n");
     }
 
     {
@@ -323,7 +491,19 @@ int main(int argc, char** argv) {
         }
     }
 
-    {
+    std::filesystem::path rootDir(workdir / "root");
+    std::filesystem::create_directories(rootDir);
+
+    if (defaultMounts) {
+        {
+            auto etcDir = rootDir / "etc";
+            std::filesystem::create_directory(etcDir);
+
+            SeedFile(etcDir / "shadow", "root:*:16176:0:99999:7:::\nnobody:*:15828:0:99999:7:::\n");
+            SeedFile(etcDir / "passwd", "root:x:0:0:root:/:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n");
+            SeedFile(etcDir / "group", "root:x:0:\nnobody:x:65534:\n");
+        }
+
         for (const std::string& dir : {
             "bin",
             "lib",
@@ -386,22 +566,6 @@ int main(int argc, char** argv) {
 
     } else if (pid == 0) {
         {
-            int rv = setuid(0);
-
-            if (rv == -1) {
-                perror("setuid");
-                return 1;
-            }
-
-            rv = setgid(0);
-
-            if (rv == -1) {
-                perror("setgid");
-                return 1;
-            }
-        }
-
-        {
             int rv = unshare(CLONE_NEWNS);
 
             if (rv == -1) {
@@ -433,9 +597,25 @@ int main(int argc, char** argv) {
             }
         }
 
-        execvp(argv[3], &argv[3]);
+        {
+            int rv = setgid(newGid);
+
+            if (rv == -1) {
+                perror("setgid");
+                return 1;
+            }
+
+            rv = setuid(newUid);
+
+            if (rv == -1) {
+                perror("setuid");
+                return 1;
+            }
+        }
+
+        execvp(binaryAndArgs.front(), binaryAndArgs.data());
         perror("execvp");
-        return 1;
+        exit(1);
 
     } else {
         while (true) {
