@@ -101,23 +101,24 @@ static inline bool SetFileContent(const std::filesystem::path& path, const std::
 
 static inline void MountSpecial() {
     static const std::unordered_set<std::string> emptyMounts;
-    static const std::vector<std::tuple<std::string, std::string, std::string, int>> specialFses {
-        {"sysfs", "sys", "/sys", 0},
-        {"proc", "proc", "/proc", MS_REC},
-        {"devtmpfs", "udev", "/dev", 0}
+    static const std::vector<std::tuple<std::string, std::string, std::string>> specialFses {
+        {"sysfs", "sys", "/sys"},
+        {"proc", "proc", "/proc"},
+        {"devtmpfs", "udev", "/dev"}
     };
 
-    for (const auto& [fstype, source, dest, flags] : specialFses) {
+    for (const auto& [fstype, source, dest] : specialFses) {
         std::filesystem::create_directory(dest);
 
         if (IsMountPoint(dest, emptyMounts)) {
             continue;
         }
 
-        STDERR(
-            mount(source.c_str(), dest.c_str(), fstype.c_str(), flags, nullptr),
-            "mount(" + dest + ")"
-        );
+        int rv = mount(source.c_str(), dest.c_str(), fstype.c_str(), MS_REC|MS_NOSUID|MS_NOEXEC, nullptr);
+
+        if (rv == -1) {
+            PError("mount(" + dest + ")");
+        }
     }
 }
 
@@ -176,7 +177,9 @@ int main(int argc, char** argv) {
     bool haveCPUMaxPeriod(false);
     bool haveMemoryLimit(false);
     bool tryCGroup2(true);
+    bool tryCGroup1(true);
     unsigned int killTimeout(3);
+    bool tryUserNs(true);
 
     auto mounts = GetMounts();
 
@@ -222,9 +225,15 @@ int main(int argc, char** argv) {
             } else if (strcmp("--no-cgroup2", argv[i]) == 0) {
                 tryCGroup2 = false;
 
+            } else if (strcmp("--no-cgroup1", argv[i]) == 0) {
+                tryCGroup1 = false;
+
             } else if (strcmp("--kill-timeout", argv[i]) == 0) {
                 ++i;
                 NAC::NStringUtils::FromString(strlen(argv[i]), argv[i], killTimeout);
+
+            } else if (strcmp("--no-user-ns", argv[i]) == 0) {
+                tryUserNs = false;
 
             } else {
                 switch (posNum) {
@@ -261,7 +270,7 @@ int main(int argc, char** argv) {
         || binaryAndArgs.empty()
     ) {
         std::cerr
-            << "USAGE:\n\t" << argv[0] << " [--mem-max 1073741824] [--cpu-max 10000] [--cpu-max-period 100000] [--root] [--uid 0] [--gid 0] [--no-default-mounts] [--kill-timeout 3] id /path/to/workdir /path/to/binary [binary args]\n"
+            << "USAGE:\n\t" << argv[0] << " [--mem-max 1073741824] [--cpu-max 10000] [--cpu-max-period 100000] [--root] [--uid 0] [--gid 0] [--no-default-mounts] [--no-cgroup2] [--no-cgroup1] [--kill-timeout 3] [--no-user-ns] id /path/to/workdir /path/to/binary [binary args]\n"
             << "\n"
             << "REQUIRED PARAMETERS:\n"
             << "\tid - Unique id for running command; will be used as cgroup name\n"
@@ -276,8 +285,10 @@ int main(int argc, char** argv) {
             << "\t--uid - Run as user with that id (setuid)\n"
             << "\t--gid - Run with a group of that id (setgid)\n"
             << "\t--no-default-mounts - Do not attempt to mount default host directories such as /bin and /lib into chroot\n"
-            << "\t--no-cgroup2 - Do not try to use cgroup2\n"
+            << "\t--no-cgroup2 - Do not try to use cgroup v2\n"
+            << "\t--no-cgroup1 - Do not try to use cgroup v1\n"
             << "\t--kill-timeout - Seconds to wait before sending SIGKILL to child processes after controlling process disappeared\n"
+            << "\t--no-user-ns - Do not create new user namespace\n"
             << std::endl
         ;
 
@@ -314,7 +325,7 @@ int main(int argc, char** argv) {
             if (rv == 0) {
                 SetFileContent(cgroupVersionFileName, "2");
 
-            } else if (errno == ENODEV) {
+            } else if ((errno == ENODEV) && tryCGroup1) {
                 if (!IsMountPoint(defaultCGroupV1Path, mounts)) {
                     std::filesystem::create_directories(defaultCGroupV1Path);
                     STDERR(
@@ -511,6 +522,49 @@ int main(int argc, char** argv) {
 
     close(watcherFds[0]);
 
+    std::string uidMap;
+    std::string gidMap;
+
+    const std::vector<std::pair<std::string, std::string*>> userNsCfg {
+        {"uid_map", &uidMap},
+        {"gid_map", &gidMap}
+    };
+
+    auto loadUserNsData = [&userNsCfg, &tryUserNs](const std::string& source = "self"){
+        if (!tryUserNs) {
+            return;
+        }
+
+        std::string line;
+        std::string strippedLine;
+
+        for (auto&& [mapPath, out] : userNsCfg) {
+            std::ifstream file("/proc/" + source + "/" + mapPath);
+
+            while (std::getline(file, line)) {
+                NAC::NStringUtils::Strip(line, strippedLine, 3, " \t\r");
+                (*out) += strippedLine + "\n";
+            }
+        }
+    };
+
+    auto saveUserNsData = [&userNsCfg, &tryUserNs](const std::string& source){
+        if (!tryUserNs) {
+            return;
+        }
+
+        for (const auto& [mapPath, data] : userNsCfg) {
+            if (data->empty()) {
+                continue;
+            }
+
+            if (!SetFileContent(std::filesystem::path("/proc/" + source + "/" + mapPath), *data)) {
+                std::cerr << "Failed to write " << mapPath << std::endl;
+                exit(1);
+            }
+        }
+    };
+
     {
         std::filesystem::path nsDir(workdir / "ns");
         std::filesystem::create_directory(nsDir);
@@ -540,7 +594,14 @@ int main(int argc, char** argv) {
 
             if (!IsMountPoint(path, mounts)) {
                 flags |= it.first;
-                NAC::TFile file(path.string(), NAC::TFile::ACCESS_CREATE);
+
+                {
+                    NAC::TFile file(path.string(), NAC::TFile::ACCESS_CREATE);
+                }
+
+                // if (it.first == CLONE_NEWUSER) {
+                //     loadUserNsData();
+                // }
             }
         }
 
@@ -558,8 +619,7 @@ int main(int argc, char** argv) {
                 close(fds[0]);
 
                 STDERR(unshare(flags), "unshare");
-
-                write(fds[1], "1", 1);
+                STDERR(write(fds[1], "1", 1), "write");
 
                 unsigned int toSleep(60);
 
@@ -586,6 +646,10 @@ int main(int argc, char** argv) {
                 }
 
                 close(fds[0]);
+
+                // if (flags & CLONE_NEWUSER) {
+                //     saveUserNsData(std::to_string(pid));
+                // }
 
                 const std::filesystem::path childNs("/proc/" + std::to_string(pid) + "/ns");
 
@@ -686,6 +750,15 @@ int main(int argc, char** argv) {
 
     STDERR(chdir(rootDir.c_str()), "chdir(" + rootDir.string() + ")");
 
+    uidMap = "";
+    gidMap = "";
+
+    loadUserNsData();
+
+    int parentToChildFds[2], childToParentFds[2];
+    STDERR(pipe(parentToChildFds), "pipe");
+    STDERR(pipe(childToParentFds), "pipe");
+
     ChildPid_ = fork();
 
     if (ChildPid_ < 0) {
@@ -694,6 +767,8 @@ int main(int argc, char** argv) {
 
     } else if (ChildPid_ == 0) {
         close(watcherFds[1]);
+        close(parentToChildFds[1]);
+        close(childToParentFds[0]);
 
         STDERR(setpgid(0, 0), "setpgid");
 
@@ -701,12 +776,52 @@ int main(int argc, char** argv) {
         STDERR(tcsetpgrp(STDIN_FILENO, getpid()), "tcsetpgrp");
         signal(SIGTTOU, SIG_DFL);
 
+        static const std::filesystem::path oldfs(".lwi-oldfs");
+        std::filesystem::create_directory(oldfs);
+
         STDERR(unshare(CLONE_NEWNS), "unshare(newns)");
-        STDERR(syscall(SYS_pivot_root, ".", "."), "pivot_root");
-        STDERR(umount2(".", MNT_DETACH), "umount2");
+        STDERR(syscall(SYS_pivot_root, ".", oldfs.c_str()), "pivot_root");
+        STDERR(umount2(oldfs.c_str(), MNT_DETACH), "umount2");
         STDERR(chroot("."), "chroot");
 
         MountSpecial();
+
+        if (tryUserNs) {
+            {
+                char req('1');
+                int rv = unshare(CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWCGROUP);
+
+                if (rv == -1) {
+                    const auto e = errno;
+                    PError("unshare(newuser)");
+
+                    if (e == EPERM) {
+                        req = '0';
+
+                    } else {
+                        exit(1);
+                    }
+                }
+
+                STDERR(write(childToParentFds[1], &req, 1), "write");
+            }
+
+            {
+                char buf;
+                int rv = read(parentToChildFds[0], &buf, 1);
+
+                if (rv != 1) {
+                    if (rv < 0) {
+                        PError("read");
+                    }
+
+                    exit(1);
+                }
+            }
+        }
+
+        close(parentToChildFds[0]);
+        close(childToParentFds[1]);
 
         STDERR(setgid(newGid), "setgid");
         STDERR(setuid(newUid), "setuid");
@@ -719,6 +834,33 @@ int main(int argc, char** argv) {
         exit(1);
 
     } else {
+        close(parentToChildFds[0]);
+        close(childToParentFds[1]);
+
+        if (tryUserNs) {
+            {
+                char buf;
+                int rv = read(childToParentFds[0], &buf, 1);
+
+                if (rv != 1) {
+                    if (rv < 0) {
+                        PError("read");
+                    }
+
+                    exit(1);
+                }
+
+                if (buf == '1') {
+                    saveUserNsData(std::to_string(ChildPid_));
+                }
+            }
+
+            STDERR(write(parentToChildFds[1], "1", 1), "write");
+        }
+
+        close(parentToChildFds[1]);
+        close(childToParentFds[0]);
+
         {
             size_t offset(0);
             uint64_t out(ChildPid_);
@@ -745,7 +887,7 @@ int main(int argc, char** argv) {
 
         while (true) {
             int status;
-            waitpid(ChildPid_, &status, 0);
+            STDERR(waitpid(ChildPid_, &status, 0), "waitpid");
 
             if (WIFEXITED(status)) {
                 return WEXITSTATUS(status);
@@ -753,8 +895,11 @@ int main(int argc, char** argv) {
             } else if (WIFSIGNALED(status)) {
                 return 1;
 
-            } else {
+            } else if (WIFSTOPPED(status) || WIFCONTINUED(status)) {
                 sleep(1);
+
+            } else {
+                return 1;
             }
         }
     }
