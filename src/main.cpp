@@ -29,14 +29,31 @@ namespace std {
 }
 #endif
 
+#define STDERR(impl, errmsg) { \
+    if ((impl) == -1) { \
+        PError(errmsg); \
+        exit(1); \
+    } \
+}
+
+static inline void PError(const char* msg) {
+    perror(msg);
+}
+
+static inline void PError(const std::string& msg) {
+    PError(msg.c_str());
+}
+
+static inline void PError(const std::filesystem::path& msg) {
+    PError(msg.c_str());
+}
+
 static inline dev_t GetDeviceID(const std::string& path) {
     struct stat out;
-    int rv = stat(path.c_str(), &out);
-
-    if (rv == -1) {
-        perror(("stat(" + path + ")").c_str());
-        return 0;
-    }
+    STDERR(
+        stat(path.c_str(), &out),
+        "stat(" + path + ")"
+    );
 
     return out.st_dev;
 }
@@ -82,7 +99,7 @@ static inline bool SetFileContent(const std::filesystem::path& path, const std::
     return (bool)file;
 }
 
-static inline bool MountSpecial() {
+static inline void MountSpecial() {
     static const std::unordered_set<std::string> emptyMounts;
     static const std::vector<std::tuple<std::string, std::string, std::string, int>> specialFses {
         {"sysfs", "sys", "/sys", 0},
@@ -97,18 +114,51 @@ static inline bool MountSpecial() {
             continue;
         }
 
-        int rv = mount(source.c_str(), dest.c_str(), fstype.c_str(), flags, nullptr);
-
-        if (rv == -1) {
-            perror(("mount(" + dest + ")").c_str());
-            return false;
-        }
+        STDERR(
+            mount(source.c_str(), dest.c_str(), fstype.c_str(), flags, nullptr),
+            "mount(" + dest + ")"
+        );
     }
+}
 
-    return true;
+int WatcherPid_;
+int ChildPid_;
+
+static inline void SignalForward(int sig) {
+    if (ChildPid_ > 0) {
+        kill(sig, ChildPid_);
+    }
+}
+
+void SignalExit(int sig) {
+    SignalForward(sig);
+    exit(1);
 }
 
 int main(int argc, char** argv) {
+    ChildPid_ = 0;
+
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
+
+    for (const auto sig : {
+        SIGHUP,
+        SIGINT,
+        SIGQUIT,
+        SIGABRT,
+        SIGTERM
+    }) {
+        signal(sig, SignalExit);
+    }
+
+    for (const auto sig : {
+        SIGUSR1,
+        SIGUSR2,
+        SIGWINCH
+    }) {
+        signal(sig, SignalForward);
+    }
+
     const char* runId("\0");
     const char* pathToWorkdir("\0");
     std::vector<char*> binaryAndArgs;
@@ -122,6 +172,7 @@ int main(int argc, char** argv) {
     bool haveCPUMaxPeriod(false);
     bool haveMemoryLimit(false);
     bool tryCGroup2(true);
+    unsigned int killTimeout(3);
 
     auto mounts = GetMounts();
 
@@ -167,6 +218,10 @@ int main(int argc, char** argv) {
             } else if (strcmp("--no-cgroup2", argv[i]) == 0) {
                 tryCGroup2 = false;
 
+            } else if (strcmp("--kill-timeout", argv[i]) == 0) {
+                ++i;
+                NAC::NStringUtils::FromString(strlen(argv[i]), argv[i], killTimeout);
+
             } else {
                 switch (posNum) {
                     case 0: {
@@ -202,7 +257,7 @@ int main(int argc, char** argv) {
         || binaryAndArgs.empty()
     ) {
         std::cerr
-            << "USAGE:\n\t" << argv[0] << " [--mem-max 1073741824] [--cpu-max 10000] [--cpu-max-period 100000] [--root] [--uid 0] [--gid 0] [--no-default-mounts] id /path/to/workdir /path/to/binary [binary args]\n"
+            << "USAGE:\n\t" << argv[0] << " [--mem-max 1073741824] [--cpu-max 10000] [--cpu-max-period 100000] [--root] [--uid 0] [--gid 0] [--no-default-mounts] [--kill-timeout 3] id /path/to/workdir /path/to/binary [binary args]\n"
             << "\n"
             << "REQUIRED PARAMETERS:\n"
             << "\tid - Unique id for running command; will be used as cgroup name\n"
@@ -218,6 +273,7 @@ int main(int argc, char** argv) {
             << "\t--gid - Run with a group of that id (setgid)\n"
             << "\t--no-default-mounts - Do not attempt to mount default host directories such as /bin and /lib into chroot\n"
             << "\t--no-cgroup2 - Do not try to use cgroup2\n"
+            << "\t--kill-timeout - Seconds to wait before sending SIGKILL to child processes after controlling process disappeared\n"
             << std::endl
         ;
 
@@ -229,14 +285,10 @@ int main(int argc, char** argv) {
     std::filesystem::path workdir(std::filesystem::absolute(pathToWorkdir));
     std::filesystem::create_directories(workdir);
 
-    {
-        int rv = chdir(pathToWorkdir);
-
-        if (rv == -1) {
-            perror((std::string("chdir(") + pathToWorkdir + ")").c_str());
-            return 1;
-        }
-    }
+    STDERR(
+        chdir(pathToWorkdir),
+        std::string("chdir(") + pathToWorkdir + ")"
+    );
 
     {
         std::filesystem::path cgroupDir(workdir / "cgroup");
@@ -261,25 +313,21 @@ int main(int argc, char** argv) {
             } else if (errno == ENODEV) {
                 if (!IsMountPoint(defaultCGroupV1Path, mounts)) {
                     std::filesystem::create_directories(defaultCGroupV1Path);
-                    rv = mount("cgroup_root", defaultCGroupV1Path.c_str(), "tmpfs", 0, nullptr);
-
-                    if (rv == -1) {
-                        perror("mount(cgroup)");
-                        return 1;
-                    }
+                    STDERR(
+                        mount("cgroup_root", defaultCGroupV1Path.c_str(), "tmpfs", 0, nullptr),
+                        "mount(cgroup)"
+                    );
                 }
 
-                rv = mount(defaultCGroupV1Path.c_str(), cgroupDir.c_str(), "none", MS_BIND, nullptr);
-
-                if (rv == -1) {
-                    perror("mount(bind cgroup)");
-                    return 1;
-                }
+                STDERR(
+                    mount(defaultCGroupV1Path.c_str(), cgroupDir.c_str(), "none", MS_BIND, nullptr),
+                    "mount(bind cgroup)"
+                );
 
                 SetFileContent(cgroupVersionFileName, "1");
 
             } else {
-                perror("mount(cgroup2)");
+                PError("mount(cgroup2)");
                 return 1;
             }
         }
@@ -304,13 +352,10 @@ int main(int argc, char** argv) {
 
                 if (!IsMountPoint(path, mounts)) {
                     std::filesystem::create_directory(path);
-
-                    int rv = mount("cgroup", path.c_str(), "cgroup", 0, controller.c_str());
-
-                    if (rv == -1) {
-                        perror(("mount(cgroup/" + controller + ")").c_str());
-                        return 1;
-                    }
+                    STDERR(
+                        mount("cgroup", path.c_str(), "cgroup", 0, controller.c_str()),
+                        "mount(cgroup/" + controller + ")"
+                    );
                 }
 
                 path /= runId;
@@ -402,6 +447,66 @@ int main(int argc, char** argv) {
         }
     }
 
+    int watcherFds[2];
+    STDERR(pipe(watcherFds), "pipe");
+
+    WatcherPid_ = fork();
+
+    if (WatcherPid_ < 0) {
+        PError("fork");
+        return 1;
+
+    } else if (WatcherPid_ == 0) {
+        close(watcherFds[1]);
+        STDERR(setsid(), "setsid");
+        uint64_t childPid;
+        size_t offset(0);
+
+        while (offset < sizeof(childPid)) {
+            int rv = read(watcherFds[0], ((char*)&childPid) + offset, sizeof(childPid) - offset);
+
+            if (rv > 0) {
+                offset += (size_t)read;
+
+            } else {
+                if (rv < 0) {
+                    if ((errno == EINTR) || (errno == ETIMEDOUT)) {
+                        continue;
+                    }
+
+                    PError("read");
+                }
+
+                exit(1);
+            }
+        }
+
+        while (true) {
+            char buf;
+            int rv = read(watcherFds[0], &buf, 1);
+
+            if ((rv < 0) && ((errno == EINTR) || (errno == ETIMEDOUT))) {
+                continue;
+            }
+
+            while (killTimeout > 0) {
+                killTimeout = sleep(killTimeout);
+            }
+
+            kill(-1 * (int)childPid, SIGKILL);
+            break;
+        }
+
+        exit(0);
+    }
+
+    STDERR(std::atexit([](){
+        kill(WatcherPid_, SIGKILL);
+
+    }), "atexit");
+
+    close(watcherFds[0]);
+
     {
         std::filesystem::path nsDir(workdir / "ns");
         std::filesystem::create_directory(nsDir);
@@ -437,30 +542,18 @@ int main(int argc, char** argv) {
 
         if (flags > 0) {
             int fds[2];
-
-            {
-                int rv = pipe(fds);
-
-                if (rv == -1) {
-                    perror("pipe");
-                    return 1;
-                }
-            }
+            STDERR(pipe(fds), "pipe");
 
             int pid = fork();
 
             if (pid < 0) {
-                perror("fork");
+                PError("fork");
                 return 1;
 
             } else if (pid == 0) {
                 close(fds[0]);
-                int rv = unshare(flags);
 
-                if (rv == -1) {
-                    perror("unshare");
-                    return 1;
-                }
+                STDERR(unshare(flags), "unshare");
 
                 write(fds[1], "1", 1);
 
@@ -470,7 +563,7 @@ int main(int argc, char** argv) {
                     toSleep = sleep(toSleep);
                 }
 
-                return 0;
+                exit(0);
 
             } else {
                 close(fds[1]);
@@ -480,13 +573,15 @@ int main(int argc, char** argv) {
 
                 if (rv != 1) {
                     if (rv == -1) {
-                        perror("read");
+                        PError("read");
                     }
 
                     kill(pid, 9);
                     waitpid(pid, nullptr, 0);
                     return 1;
                 }
+
+                close(fds[0]);
 
                 const std::filesystem::path childNs("/proc/" + std::to_string(pid) + "/ns");
 
@@ -495,7 +590,7 @@ int main(int argc, char** argv) {
                         int rv = mount((childNs / it.second).c_str(), (nsDir / it.second).c_str(), "none", MS_BIND, nullptr);
 
                         if (rv == -1) {
-                            perror(("mount(bind namespace " + it.second + ")").c_str());
+                            PError("mount(bind namespace " + it.second + ")");
                             kill(pid, 9);
                             waitpid(pid, nullptr, 0);
                             return 1;
@@ -508,14 +603,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        {
-            int rv = unshare(CLONE_NEWPID);
-
-            if (rv == -1) {
-                perror("unshare(newpid)");
-                return 1;
-            }
-        }
+        STDERR(unshare(CLONE_NEWPID), "unshare(newpid)");
 
         for (const auto& it : nsMap) {
             if (!(supportedFlags & it.first)) {
@@ -526,25 +614,17 @@ int main(int argc, char** argv) {
             int fh = open(path.c_str(), O_RDONLY);
 
             if (fh == -1) {
-                perror(("open(" + path.string() + ")").c_str());
+                PError("open(" + path.string() + ")");
                 return 1;
             }
 
-            int rv = setns(fh, it.first);
-
-            if (rv == -1) {
-                perror(("setns(" + it.second + ")").c_str());
-                close(fh);
-                return 1;
-            }
+            STDERR(setns(fh, it.first), "setns(" + it.second + ")");
 
             close(fh);
         }
     }
 
-    if (!MountSpecial()) {
-        return 1;
-    }
+    MountSpecial();
 
     mounts.merge(GetMounts());
 
@@ -552,12 +632,10 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(rootDir);
 
     if (!IsMountPoint(rootDir, mounts)) {
-        int rv = mount(rootDir.c_str(), rootDir.c_str(), "none", MS_BIND|MS_REC, nullptr);
-
-        if (rv == -1) {
-            perror("mount(bind root)");
-            return 1;
-        }
+        STDERR(
+            mount(rootDir.c_str(), rootDir.c_str(), "none", MS_BIND|MS_REC, nullptr),
+            "mount(bind root)"
+        );
     }
 
     if (defaultMounts) {
@@ -590,102 +668,80 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            int rv = mount(source.c_str(), dest.c_str(), "none", MS_BIND|MS_RDONLY, nullptr);
+            STDERR(
+                mount(source.c_str(), dest.c_str(), "none", MS_BIND|MS_RDONLY, nullptr),
+                "mount(" + source.string() + ")"
+            );
 
-            if (rv == -1) {
-                perror(("mount(" + source.string() + ")").c_str());
-                return 1;
-            }
-
-            rv = mount("none", dest.c_str(), nullptr, MS_REMOUNT|MS_BIND|MS_RDONLY, nullptr);
-
-            if (rv == -1) {
-                perror(("ro-remount(" + source.string() + ")").c_str());
-                return 1;
-            }
+            STDERR(
+                mount("none", dest.c_str(), nullptr, MS_REMOUNT|MS_BIND|MS_RDONLY, nullptr),
+                "ro-remount(" + source.string() + ")"
+            );
         }
     }
 
-    {
-        int rv = chdir(rootDir.c_str());
+    STDERR(chdir(rootDir.c_str()), "chdir(" + rootDir.string() + ")");
 
-        if (rv == -1) {
-            perror(("chdir(" + rootDir.string() + ")").c_str());
-            return 1;
-        }
-    }
+    int ChildPid_ = fork();
 
-    int pid = fork();
-
-    if (pid < 0) {
-        perror("fork");
+    if (ChildPid_ < 0) {
+        PError("fork");
         return 1;
 
-    } else if (pid == 0) {
-        {
-            int rv = unshare(CLONE_NEWNS);
+    } else if (ChildPid_ == 0) {
+        close(watcherFds[1]);
 
-            if (rv == -1) {
-                perror("unshare(newns)");
-                return 1;
-            }
-        }
+        STDERR(setpgid(0, 0), "setpgid");
 
-        {
-            long rv = syscall(SYS_pivot_root, ".", ".");
+        signal(SIGTTOU, SIG_IGN);
+        STDERR(tcsetpgrp(STDIN_FILENO, getpid()), "tcsetpgrp");
+        signal(SIGTTOU, SIG_DFL);
 
-            if (rv == -1) {
-                perror("pivot_root");
-                return 1;
-            }
-        }
+        STDERR(unshare(CLONE_NEWNS), "unshare(newns)");
+        STDERR(syscall(SYS_pivot_root, ".", "."), "pivot_root");
+        STDERR(umount2(".", MNT_DETACH), "umount2");
+        STDERR(chroot("."), "chroot");
 
-        {
-            int rv = umount2(".", MNT_DETACH);
+        MountSpecial();
 
-            if (rv == -1) {
-                perror("umount2");
-                return 1;
-            }
-        }
+        STDERR(setgid(newGid), "setgid");
+        STDERR(setuid(newUid), "setuid");
 
-        {
-            int rv = chroot(".");
-
-            if (rv == -1) {
-                perror("chroot");
-                return 1;
-            }
-        }
-
-        if (!MountSpecial()) {
-            return 1;
-        }
-
-        {
-            int rv = setgid(newGid);
-
-            if (rv == -1) {
-                perror("setgid");
-                return 1;
-            }
-
-            rv = setuid(newUid);
-
-            if (rv == -1) {
-                perror("setuid");
-                return 1;
-            }
-        }
+        signal(SIGPIPE, SIG_DFL);
+        signal(SIGCHLD, SIG_DFL);
 
         execvp(binaryAndArgs.front(), binaryAndArgs.data());
-        perror("execvp");
+        PError("execvp");
         exit(1);
 
     } else {
+        {
+            size_t offset(0);
+            uint64_t out(ChildPid_);
+
+            while (offset < sizeof(out)) {
+                int rv = write(watcherFds[1], ((char*)&out) + offset, sizeof(out) - offset);
+
+                if (rv > 0) {
+                    offset += (size_t)rv;
+
+                } else {
+                    if (rv < 0) {
+                        if ((errno == EINTR) || (errno == ETIMEDOUT)) {
+                            continue;
+                        }
+
+                        PError("write");
+                    }
+
+                    break;
+                }
+            }
+        }
+
         while (true) {
             int status;
-            waitpid(pid, &status, 0);
+            waitpid(ChildPid_, &status, 0);
 
             if (WIFEXITED(status)) {
                 return WEXITSTATUS(status);
