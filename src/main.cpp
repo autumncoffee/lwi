@@ -124,15 +124,19 @@ static inline void MountSpecial() {
 int WatcherPid_;
 int ChildPid_;
 
-static inline void SignalForward(int sig) {
+void SignalForward(int sig) {
     if (ChildPid_ > 0) {
-        kill(sig, ChildPid_);
+        kill(ChildPid_, sig);
     }
 }
 
 void SignalExit(int sig) {
-    SignalForward(sig);
-    exit(1);
+    if (ChildPid_ > 0) {
+        kill(ChildPid_, sig);
+
+    } else {
+        exit(1);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -576,7 +580,7 @@ int main(int argc, char** argv) {
                         PError("read");
                     }
 
-                    kill(pid, 9);
+                    kill(pid, SIGKILL);
                     waitpid(pid, nullptr, 0);
                     return 1;
                 }
@@ -591,14 +595,14 @@ int main(int argc, char** argv) {
 
                         if (rv == -1) {
                             PError("mount(bind namespace " + it.second + ")");
-                            kill(pid, 9);
+                            kill(pid, SIGKILL);
                             waitpid(pid, nullptr, 0);
                             return 1;
                         }
                     }
                 }
 
-                kill(pid, 9);
+                kill(pid, SIGKILL);
                 waitpid(pid, nullptr, 0);
             }
         }
@@ -682,7 +686,7 @@ int main(int argc, char** argv) {
 
     STDERR(chdir(rootDir.c_str()), "chdir(" + rootDir.string() + ")");
 
-    int ChildPid_ = fork();
+    ChildPid_ = fork();
 
     if (ChildPid_ < 0) {
         PError("fork");
