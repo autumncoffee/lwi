@@ -787,7 +787,16 @@ int main(int argc, char** argv) {
         STDERR(setpgid(0, 0), "setpgid");
 
         signal(SIGTTOU, SIG_IGN);
-        STDERR(tcsetpgrp(STDIN_FILENO, getpid()), "tcsetpgrp");
+
+        {
+            int rv = tcsetpgrp(STDIN_FILENO, getpid());
+
+            if ((rv == -1) && (errno != ENOTTY)) {
+                PError("tcsetpgrp");
+                exit(1);
+            }
+        }
+
         signal(SIGTTOU, SIG_DFL);
 
         STDERR(unshare(CLONE_NEWNS), "unshare(newns)");
