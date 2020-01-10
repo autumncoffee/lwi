@@ -126,7 +126,7 @@ static inline int DirFh(const std::filesystem::path& path) {
     int fh = open(path.c_str(), O_DIRECTORY | O_PATH);
 
     if (fh == -1) {
-        PError("open(" + path + ")");
+        PError("open(" + path.string() + ")");
         exit(1);
     }
 
