@@ -122,6 +122,17 @@ static inline void MountSpecial() {
     }
 }
 
+static inline int DirFh(const std::filesystem::path& path) {
+    int fh = open(path.c_str(), O_DIRECTORY | O_PATH);
+
+    if (fh == -1) {
+        PError("open(" + path + ")");
+        exit(1);
+    }
+
+    return fh;
+}
+
 int WatcherPid_;
 int ChildPid_;
 
@@ -692,9 +703,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    // MountSpecial();
-    //
-    // mounts.merge(GetMounts());
+    STDERR(
+        mount("none", "/", nullptr, MS_REC|MS_PRIVATE, nullptr),
+        "private-remount(/)"
+    );
+
+    MountSpecial();
+
+    mounts.merge(GetMounts());
 
     std::filesystem::path rootDir(workdir / "root");
     std::filesystem::create_directories(rootDir);
@@ -705,11 +721,6 @@ int main(int argc, char** argv) {
             "mount(bind root)"
         );
     }
-
-    STDERR(
-        mount("none", rootDir.c_str(), nullptr, MS_REMOUNT|MS_BIND|MS_PRIVATE, nullptr),
-        "private-remount(" + rootDir.string() + ")"
-    );
 
     if (defaultMounts) {
         {
@@ -753,8 +764,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    STDERR(chdir(rootDir.c_str()), "chdir(" + rootDir.string() + ")");
-
     uidMap = "";
     gidMap = "";
 
@@ -782,9 +791,18 @@ int main(int argc, char** argv) {
         signal(SIGTTOU, SIG_DFL);
 
         STDERR(unshare(CLONE_NEWNS), "unshare(newns)");
+
+        int oldRoot = DirFh("/");
+        int newRoot = DirFh(rootDir);
+
+        STDERR(fchdir(newRoot), "fchdir(" + rootDir.string() + ")");
         STDERR(syscall(SYS_pivot_root, ".", "."), "pivot_root");
+        STDERR(fchdir(oldRoot), "fchdir(/)");
         STDERR(umount2(".", MNT_DETACH), "umount2");
+        STDERR(fchdir(newRoot), "fchdir(" + rootDir.string() + ")");
         STDERR(chroot("."), "chroot");
+        STDERR(close(newRoot), "close(newRoot)");
+        STDERR(close(oldRoot), "close(oldRoot)");
 
         MountSpecial();
 
