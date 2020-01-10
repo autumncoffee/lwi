@@ -114,7 +114,7 @@ static inline void MountSpecial() {
             continue;
         }
 
-        int rv = mount(source.c_str(), dest.c_str(), fstype.c_str(), MS_REC|MS_NOSUID|MS_NOEXEC|MS_PRIVATE, nullptr);
+        int rv = mount(source.c_str(), dest.c_str(), fstype.c_str(), MS_REC|MS_NOSUID|MS_NOEXEC, nullptr);
 
         if (rv == -1) {
             PError("mount(" + dest + ")");
@@ -316,7 +316,7 @@ int main(int argc, char** argv) {
             int rv = -1;
 
             if (tryCGroup2) {
-                rv = mount("none", cgroupDir.c_str(), "cgroup2", MS_REC|MS_PRIVATE, nullptr);
+                rv = mount("none", cgroupDir.c_str(), "cgroup2", 0, nullptr);
 
             } else {
                 errno = ENODEV;
@@ -329,13 +329,13 @@ int main(int argc, char** argv) {
                 if (!IsMountPoint(defaultCGroupV1Path, mounts)) {
                     std::filesystem::create_directories(defaultCGroupV1Path);
                     STDERR(
-                        mount("cgroup_root", defaultCGroupV1Path.c_str(), "tmpfs", MS_REC|MS_PRIVATE, nullptr),
+                        mount("cgroup_root", defaultCGroupV1Path.c_str(), "tmpfs", 0, nullptr),
                         "mount(cgroup)"
                     );
                 }
 
                 STDERR(
-                    mount(defaultCGroupV1Path.c_str(), cgroupDir.c_str(), "none", MS_BIND|MS_REC|MS_PRIVATE, nullptr),
+                    mount(defaultCGroupV1Path.c_str(), cgroupDir.c_str(), "none", MS_BIND, nullptr),
                     "mount(bind cgroup)"
                 );
 
@@ -368,7 +368,7 @@ int main(int argc, char** argv) {
                 if (!IsMountPoint(path, mounts)) {
                     std::filesystem::create_directory(path);
                     STDERR(
-                        mount("cgroup", path.c_str(), "cgroup", MS_REC|MS_PRIVATE, controller.c_str()),
+                        mount("cgroup", path.c_str(), "cgroup", 0, controller.c_str()),
                         "mount(cgroup/" + controller + ")"
                     );
                 }
@@ -655,7 +655,7 @@ int main(int argc, char** argv) {
 
                 for (const auto& it : nsMap) {
                     if (flags & it.first) {
-                        int rv = mount((childNs / it.second).c_str(), (nsDir / it.second).c_str(), "none", MS_BIND|MS_PRIVATE, nullptr);
+                        int rv = mount((childNs / it.second).c_str(), (nsDir / it.second).c_str(), "none", MS_BIND, nullptr);
 
                         if (rv == -1) {
                             PError("mount(bind namespace " + it.second + ")");
@@ -701,7 +701,7 @@ int main(int argc, char** argv) {
 
     if (!IsMountPoint(rootDir, mounts)) {
         STDERR(
-            mount(rootDir.c_str(), rootDir.c_str(), "none", MS_BIND|MS_REC|MS_PRIVATE, nullptr),
+            mount(rootDir.c_str(), rootDir.c_str(), "none", MS_BIND|MS_REC, nullptr),
             "mount(bind root)"
         );
     }
@@ -737,12 +737,12 @@ int main(int argc, char** argv) {
             }
 
             STDERR(
-                mount(source.c_str(), dest.c_str(), "none", MS_BIND|MS_RDONLY|MS_REC|MS_PRIVATE, nullptr),
+                mount(source.c_str(), dest.c_str(), "none", MS_BIND|MS_RDONLY, nullptr),
                 "mount(" + source.string() + ")"
             );
 
             STDERR(
-                mount("none", dest.c_str(), nullptr, MS_REMOUNT|MS_BIND|MS_RDONLY|MS_REC|MS_PRIVATE, nullptr),
+                mount("none", dest.c_str(), nullptr, MS_REMOUNT|MS_BIND|MS_RDONLY, nullptr),
                 "ro-remount(" + source.string() + ")"
             );
         }
@@ -776,9 +776,12 @@ int main(int argc, char** argv) {
         STDERR(tcsetpgrp(STDIN_FILENO, getpid()), "tcsetpgrp");
         signal(SIGTTOU, SIG_DFL);
 
+        static const std::filesystem::path oldfs(".lwi-oldfs");
+        std::filesystem::create_directory(oldfs);
+
         STDERR(unshare(CLONE_NEWNS), "unshare(newns)");
-        STDERR(syscall(SYS_pivot_root, ".", "."), "pivot_root");
-        STDERR(umount2(".", MNT_DETACH), "umount2");
+        STDERR(syscall(SYS_pivot_root, ".", oldfs.c_str()), "pivot_root");
+        STDERR(umount2(oldfs.c_str(), MNT_DETACH), "umount2");
         STDERR(chroot("."), "chroot");
 
         MountSpecial();
