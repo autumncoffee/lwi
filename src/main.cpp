@@ -692,19 +692,24 @@ int main(int argc, char** argv) {
         }
     }
 
-    MountSpecial();
-
-    mounts.merge(GetMounts());
+    // MountSpecial();
+    //
+    // mounts.merge(GetMounts());
 
     std::filesystem::path rootDir(workdir / "root");
     std::filesystem::create_directories(rootDir);
 
     if (!IsMountPoint(rootDir, mounts)) {
         STDERR(
-            mount(rootDir.c_str(), rootDir.c_str(), "none", MS_BIND|MS_REC, nullptr),
+            mount(rootDir.c_str(), rootDir.c_str(), "none", MS_BIND|MS_PRIVATE, nullptr),
             "mount(bind root)"
         );
     }
+
+    STDERR(
+        mount("none", rootDir.c_str(), nullptr, MS_REMOUNT|MS_BIND|MS_PRIVATE, nullptr),
+        "private-remount(" + rootDir.string() + ")"
+    );
 
     if (defaultMounts) {
         {
@@ -776,12 +781,9 @@ int main(int argc, char** argv) {
         STDERR(tcsetpgrp(STDIN_FILENO, getpid()), "tcsetpgrp");
         signal(SIGTTOU, SIG_DFL);
 
-        static const std::filesystem::path oldfs(".lwi-oldfs");
-        std::filesystem::create_directory(oldfs);
-
         STDERR(unshare(CLONE_NEWNS), "unshare(newns)");
-        STDERR(syscall(SYS_pivot_root, ".", oldfs.c_str()), "pivot_root");
-        STDERR(umount2(oldfs.c_str(), MNT_DETACH), "umount2");
+        STDERR(syscall(SYS_pivot_root, ".", "."), "pivot_root");
+        STDERR(umount2(".", MNT_DETACH), "umount2");
         STDERR(chroot("."), "chroot");
 
         MountSpecial();
