@@ -151,11 +151,14 @@ void SignalExit(int sig) {
     }
 }
 
+void SignalEmpty(int) {
+}
+
 int main(int argc, char** argv) {
     ChildPid_ = 0;
 
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGCHLD, SIG_IGN);
+    signal(SIGCHLD, SignalEmpty);
 
     for (const auto sig : {
         SIGHUP,
@@ -856,7 +859,6 @@ int main(int argc, char** argv) {
         STDERR(setuid(newUid), "setuid");
 
         signal(SIGPIPE, SIG_DFL);
-        signal(SIGCHLD, SIG_DFL);
 
         execvp(binaryAndArgs.front(), binaryAndArgs.data());
         PError("execvp");
