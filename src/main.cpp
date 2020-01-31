@@ -104,6 +104,8 @@ static inline void MountSpecial() {
     static const std::vector<std::tuple<std::string, std::string, std::string>> specialFses {
         {"sysfs", "sys", "/sys"},
         {"proc", "proc", "/proc"},
+        {"tmpfs", "tmpfs", "/tmp"},
+        {"tmpfs", "tmpfs", "/run"},
         {"devtmpfs", "udev", "/dev"}
     };
 
@@ -733,6 +735,19 @@ int main(int argc, char** argv) {
             SeedFile(etcDir / "shadow", "root:*:16176:0:99999:7:::\nnobody:*:15828:0:99999:7:::\n");
             SeedFile(etcDir / "passwd", "root:x:0:0:root:/:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n");
             SeedFile(etcDir / "group", "root:x:0:\nnobody:x:65534:\n");
+        }
+
+        {
+            auto varDir = rootDir / "var";
+            std::filesystem::create_directory(varDir);
+
+            {
+                auto varRun = varDir / "run";
+
+                if (!std::filesystem::exists(varRun)) {
+                    STDERR(symlink("/run", varRun.c_str()), "symlink(" + varRun.string() + ")");
+                }
+            }
         }
 
         for (const std::string& dir : {
