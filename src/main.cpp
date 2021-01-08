@@ -21,12 +21,13 @@
 
 #ifdef RELEASE_FILESYSTEM
 #include <filesystem>
+
+namespace stdfs = std::filesystem;
+
 #else
 #include <experimental/filesystem>
 
-namespace std {
-    namespace filesystem = std::experimental::filesystem;
-}
+namespace stdfs = std::experimental::filesystem;
 #endif
 
 #define STDERR(impl, errmsg) { \
@@ -44,7 +45,7 @@ static inline void PError(const std::string& msg) {
     PError(msg.c_str());
 }
 
-static inline void PError(const std::filesystem::path& msg) {
+static inline void PError(const stdfs::path& msg) {
     PError(msg.c_str());
 }
 
@@ -74,8 +75,8 @@ static inline std::unordered_set<std::string> GetMounts() {
     return out;
 }
 
-static inline bool IsMountPoint(const std::filesystem::path& path, const std::unordered_set<std::string>& mounts) {
-    if (!std::filesystem::exists(path)) {
+static inline bool IsMountPoint(const stdfs::path& path, const std::unordered_set<std::string>& mounts) {
+    if (!stdfs::exists(path)) {
         return false;
     }
 
@@ -86,14 +87,14 @@ static inline bool IsMountPoint(const std::filesystem::path& path, const std::un
     return mounts.count(path.string()) > 0;
 }
 
-static inline void SeedFile(const std::filesystem::path& path, const std::string& data) {
-    if (!std::filesystem::exists(path)) {
+static inline void SeedFile(const stdfs::path& path, const std::string& data) {
+    if (!stdfs::exists(path)) {
         NAC::TFile file(path.string(), NAC::TFile::ACCESS_CREATEX);
         file.Append(data);
     }
 }
 
-static inline bool SetFileContent(const std::filesystem::path& path, const std::string& content) {
+static inline bool SetFileContent(const stdfs::path& path, const std::string& content) {
     NAC::TFile file(path.string(), NAC::TFile::ACCESS_CREATE);
     file.Append(content);
     return (bool)file;
@@ -110,7 +111,7 @@ static inline void MountSpecial() {
     };
 
     for (const auto& [fstype, source, dest] : specialFses) {
-        std::filesystem::create_directory(dest);
+        stdfs::create_directory(dest);
 
         if (IsMountPoint(dest, emptyMounts)) {
             continue;
@@ -124,7 +125,7 @@ static inline void MountSpecial() {
     }
 }
 
-static inline int DirFh(const std::filesystem::path& path) {
+static inline int DirFh(const stdfs::path& path) {
     int fh = open(path.c_str(), O_DIRECTORY | O_PATH);
 
     if (fh == -1) {
@@ -313,8 +314,8 @@ int main(int argc, char** argv) {
 
     binaryAndArgs.push_back(nullptr);
 
-    std::filesystem::path workdir(std::filesystem::absolute(pathToWorkdir));
-    std::filesystem::create_directories(workdir);
+    stdfs::path workdir(stdfs::absolute(pathToWorkdir));
+    stdfs::create_directories(workdir);
 
     STDERR(
         chdir(pathToWorkdir),
@@ -322,11 +323,11 @@ int main(int argc, char** argv) {
     );
 
     {
-        std::filesystem::path cgroupDir(workdir / "cgroup");
-        std::filesystem::create_directory(cgroupDir);
+        stdfs::path cgroupDir(workdir / "cgroup");
+        stdfs::create_directory(cgroupDir);
 
         static const std::string cgroupVersionFileName(".cgver");
-        static const std::filesystem::path defaultCGroupV1Path("/sys/fs/cgroup");
+        static const stdfs::path defaultCGroupV1Path("/sys/fs/cgroup");
 
         if (!IsMountPoint(cgroupDir, mounts)) {
             int rv = -1;
@@ -343,7 +344,7 @@ int main(int argc, char** argv) {
 
             } else if ((errno == ENODEV) && tryCGroup1) {
                 if (!IsMountPoint(defaultCGroupV1Path, mounts)) {
-                    std::filesystem::create_directories(defaultCGroupV1Path);
+                    stdfs::create_directories(defaultCGroupV1Path);
                     STDERR(
                         mount("cgroup_root", defaultCGroupV1Path.c_str(), "tmpfs", 0, nullptr),
                         "mount(cgroup)"
@@ -379,10 +380,10 @@ int main(int argc, char** argv) {
                 "blkio",
                 "pids"
             }) {
-                std::filesystem::path path(defaultCGroupV1Path / controller);
+                stdfs::path path(defaultCGroupV1Path / controller);
 
                 if (!IsMountPoint(path, mounts)) {
-                    std::filesystem::create_directory(path);
+                    stdfs::create_directory(path);
                     STDERR(
                         mount("cgroup", path.c_str(), "cgroup", 0, controller.c_str()),
                         "mount(cgroup/" + controller + ")"
@@ -390,7 +391,7 @@ int main(int argc, char** argv) {
                 }
 
                 path /= runId;
-                std::filesystem::create_directory(path);
+                stdfs::create_directory(path);
 
                 if ((controller == "memory") && haveMemoryLimit) {
                     if (!SetFileContent(path / "memory.limit_in_bytes", (
@@ -429,7 +430,7 @@ int main(int argc, char** argv) {
 
         } else if (cgroupVersionFile[0] == '2') {
             auto path = cgroupDir / runId;
-            std::filesystem::create_directory(path);
+            stdfs::create_directory(path);
 
             if (!SetFileContent(path / "cgroup.subtree_control", "+cpu +memory +io +pids")) {
                 std::cerr << "Failed to setup cgroup2" << std::endl;
@@ -574,7 +575,7 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            if (!SetFileContent(std::filesystem::path("/proc/" + source + "/" + mapPath), *data)) {
+            if (!SetFileContent(stdfs::path("/proc/" + source + "/" + mapPath), *data)) {
                 std::cerr << "Failed to write " << mapPath << std::endl;
                 exit(1);
             }
@@ -582,10 +583,10 @@ int main(int argc, char** argv) {
     };
 
     {
-        std::filesystem::path nsDir(workdir / "ns");
-        std::filesystem::create_directory(nsDir);
+        stdfs::path nsDir(workdir / "ns");
+        stdfs::create_directory(nsDir);
 
-        static const std::filesystem::path selfNs("/proc/self/ns");
+        static const stdfs::path selfNs("/proc/self/ns");
 
         static const std::vector<std::pair<int, std::string>> nsMap {
             {CLONE_NEWCGROUP, "cgroup"},
@@ -600,7 +601,7 @@ int main(int argc, char** argv) {
         int supportedFlags(0);
 
         for (const auto& it : nsMap) {
-            if (!std::filesystem::exists(selfNs / it.second)) {
+            if (!stdfs::exists(selfNs / it.second)) {
                 continue;
             }
 
@@ -667,7 +668,7 @@ int main(int argc, char** argv) {
                 //     saveUserNsData(std::to_string(pid));
                 // }
 
-                const std::filesystem::path childNs("/proc/" + std::to_string(pid) + "/ns");
+                const stdfs::path childNs("/proc/" + std::to_string(pid) + "/ns");
 
                 for (const auto& it : nsMap) {
                     if (flags & it.first) {
@@ -717,8 +718,8 @@ int main(int argc, char** argv) {
 
     mounts.merge(GetMounts());
 
-    std::filesystem::path rootDir(workdir / "root");
-    std::filesystem::create_directories(rootDir);
+    stdfs::path rootDir(workdir / "root");
+    stdfs::create_directories(rootDir);
 
     if (!IsMountPoint(rootDir, mounts)) {
         STDERR(
@@ -730,7 +731,7 @@ int main(int argc, char** argv) {
     if (defaultMounts) {
         {
             auto etcDir = rootDir / "etc";
-            std::filesystem::create_directory(etcDir);
+            stdfs::create_directory(etcDir);
 
             SeedFile(etcDir / "shadow", "root:*:16176:0:99999:7:::\nnobody:*:15828:0:99999:7:::\n");
             SeedFile(etcDir / "passwd", "root:x:0:0:root:/:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n");
@@ -739,12 +740,12 @@ int main(int argc, char** argv) {
 
         {
             auto varDir = rootDir / "var";
-            std::filesystem::create_directory(varDir);
+            stdfs::create_directory(varDir);
 
             {
                 auto varRun = varDir / "run";
 
-                if (!std::filesystem::exists(varRun)) {
+                if (!stdfs::exists(varRun)) {
                     STDERR(symlink("/run", varRun.c_str()), "symlink(" + varRun.string() + ")");
                 }
             }
@@ -757,14 +758,14 @@ int main(int argc, char** argv) {
             "sbin",
             "usr"
         }) {
-            std::filesystem::path source("/" + dir);
+            stdfs::path source("/" + dir);
 
-            if (!std::filesystem::exists(source)) {
+            if (!stdfs::exists(source)) {
                 continue;
             }
 
             auto dest = rootDir / dir;
-            std::filesystem::create_directory(dest);
+            stdfs::create_directory(dest);
 
             if (IsMountPoint(dest, mounts)) {
                 continue;
